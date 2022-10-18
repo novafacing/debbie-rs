@@ -176,6 +176,7 @@ impl Debbie {
             .buffer_unordered(CONCURRENT_REQUESTS)
             .filter_map(|versions| {
                 pb.inc(1);
+                let distro = &self.distro;
 
                 async move {
                     match versions {
@@ -183,7 +184,7 @@ impl Debbie {
                             if let Some(version) = versions
                                 .versions
                                 .iter()
-                                .filter(|v| v.suites.contains(&"bullseye".to_string()))
+                                .filter(|v| v.suites.contains(distro))
                                 .next()
                             {
                                 Some((versions.package.clone(), version.version.clone()))
