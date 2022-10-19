@@ -16,3 +16,9 @@ futures = "*"
 serde_json = "*"
 serde = { version = "*", features = ["derive"] }
 indicatif = "*"
+phf = { version = "*", features = ["macros"] }
+tar = "*"
+flate2 = "*"
+
+[build-dependencies]
+cc = "*"
