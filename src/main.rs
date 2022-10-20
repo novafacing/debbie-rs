@@ -4,8 +4,6 @@ use std::{
     fs::File as IOFile,
     io::Read,
     path::PathBuf,
-    slice::Iter,
-    thread::Thread,
 };
 
 use clap::{Parser, ValueEnum};
@@ -16,15 +14,13 @@ use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tar::Archive;
-use tl::{parse, Bytes, HTMLTag, Node, ParserOptions};
+use tl::{parse, Bytes, Node, ParserOptions};
 use tokio::{
     self,
     fs::{read_dir, File},
-    io::{self, copy, AsyncReadExt, AsyncWriteExt},
+    io::{self, AsyncWriteExt},
 };
-use tree_sitter::{
-    Language as TSLanguage, Node as TSNode, Parser as TSParser, Query, QueryCursor, TextProvider,
-};
+use tree_sitter::{Language as TSLanguage, Parser as TSParser, Query, QueryCursor};
 
 const ALL_PKGS_URL: &str = "https://sources.debian.org/api/list";
 const PKG_VERSIONS_URL: &str = "https://sources.debian.org/api/src/{packagename}/";
@@ -154,10 +150,14 @@ struct Cache {
     package_versions: Vec<(String, String)>,
     package_infos: Vec<(String, String, HashMap<String, usize>)>,
     package_links: Vec<(String, String, String)>,
-}
-
-struct StringTextProvider {
-    string: String,
+    keywords: HashMap<
+        String,
+        (
+            Vec<(String, HashMap<String, usize>, Vec<String>, usize)>,
+            Vec<(String, HashMap<String, usize>, Vec<String>, usize)>,
+        ),
+    >,
+    results: HashMap<String, (usize, f64, f64, usize, usize)>,
 }
 
 impl Cache {
@@ -169,6 +169,8 @@ impl Cache {
             package_versions: Vec::new(),
             package_infos: Vec::new(),
             package_links: Vec::new(),
+            keywords: HashMap::new(),
+            results: HashMap::new(),
         }
     }
 
@@ -712,7 +714,7 @@ impl Debbie {
                             }
                         })
                         .collect();
-                println!("{:?} {:?}", name_counts, call_counts);
+                self.cache.keywords.insert(name, (name_counts, call_counts));
             } else {
                 eprintln!("{} is not a file", entry.path().display());
             }
@@ -720,7 +722,107 @@ impl Debbie {
             pb.inc(1);
         }
 
+        self.cache.save().unwrap();
+
         pb.finish();
+
+        Ok(())
+    }
+
+    async fn analyze(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("Analyzing...");
+
+        for keyword in &self.keywords {
+            // Calculate how many of the packages contain at least one function with the keyword in the name
+            let count = self
+                .cache
+                .keywords
+                .iter()
+                .map(|(_, (name_counts, call_counts))| {
+                    (name_counts
+                        .iter()
+                        .map(|(_, counts, _, _)| counts.get(keyword).unwrap_or(&0))
+                        .sum::<usize>()
+                        > 0) as usize
+                })
+                .sum::<usize>();
+
+            // Calculate how many average over all packages of how many functions have the keyword in the name divided by the total number of functions
+            let avg_names = self
+                .cache
+                .keywords
+                .iter()
+                .map(|(_, (name_counts, _))| {
+                    let has_kword = name_counts
+                        .iter()
+                        .map(|(_, counts, _, _)| *counts.get(keyword).unwrap_or(&0) as f64)
+                        .sum::<f64>();
+                    let total = name_counts
+                        .iter()
+                        .map(|(_, _, _, total)| *total as f64)
+                        .sum::<f64>();
+                    has_kword / total
+                })
+                .filter(|x| !x.is_nan())
+                .sum::<f64>()
+                / self.jobs as f64;
+
+            let avg_calls = self
+                .cache
+                .keywords
+                .iter()
+                .map(|(_, (_, call_counts))| {
+                    let has_kword = call_counts
+                        .iter()
+                        .map(|(_, counts, _, _)| *counts.get(keyword).unwrap_or(&0) as f64)
+                        .sum::<f64>();
+                    let total = call_counts
+                        .iter()
+                        .map(|(_, _, _, total)| *total as f64)
+                        .sum::<f64>();
+                    has_kword / total
+                })
+                .filter(|x| !x.is_nan())
+                .sum::<f64>()
+                / self.jobs as f64;
+
+            let total_names = self
+                .cache
+                .keywords
+                .iter()
+                .map(|(_, (name_counts, _))| {
+                    name_counts
+                        .iter()
+                        .map(|(_, _, _, total)| total)
+                        .sum::<usize>()
+                })
+                .sum::<usize>();
+
+            let total_calls = self
+                .cache
+                .keywords
+                .iter()
+                .map(|(_, (_, call_counts))| {
+                    call_counts
+                        .iter()
+                        .map(|(_, _, _, total)| total)
+                        .sum::<usize>()
+                })
+                .sum::<usize>();
+
+            self.cache.results.insert(
+                keyword.to_string(),
+                (
+                    count,
+                    avg_names * 100.0,
+                    avg_calls * 100.0,
+                    total_names,
+                    total_calls,
+                ),
+            );
+        }
+
+        self.cache.save().unwrap();
 
         Ok(())
     }
@@ -732,7 +834,12 @@ impl Debbie {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.downloadpkgs(download_dir).await?;
         if scan {
-            self.scan().await?;
+            if self.cache.keywords.is_empty() {
+                self.scan().await?;
+            }
+            if self.cache.results.is_empty() {
+                self.analyze().await?;
+            }
         }
         Ok(())
     }
